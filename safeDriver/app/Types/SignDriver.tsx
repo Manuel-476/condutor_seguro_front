@@ -11,4 +11,4 @@ export interface Categoria {
   nome: string;
 }
 
-export const ipAddress = "http://192.168.0.102:7205/";
+export const ipAddress = "http://192.168.0.101:7205/";

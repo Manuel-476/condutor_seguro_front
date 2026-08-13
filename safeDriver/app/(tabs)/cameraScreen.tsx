@@ -24,6 +24,7 @@ interface ApiResponse {
   personCount: number;
   personDistanceMeters: number[];
   trafficSignCount: number;
+  signDistanceMeters: number[]; // Adicionado para distâncias dos sinais de trânsito
   animalCount: number;
   animalDistancesMeters: number[];
   holeCount: number;
@@ -50,6 +51,8 @@ const CameraScreen: React.FC = () => {
   const [isTransitioning, setIsTransitioning] = useState(false);
 
   const cameraRef = useRef<any>(null);
+  const lastAlertMessageRef = useRef<string | null>(null); // Rastreia a última mensagem de alerta para pessoa/animal
+  const lastAlertTimestampRef = useRef<number>(0); // Rastreia o timestamp da última reprodução
   const isFocused = useIsFocused();
 
   const flashModes = {
@@ -65,12 +68,29 @@ const CameraScreen: React.FC = () => {
     })();
   }, []);
 
+  // Para a fala e limpa estados quando a tela perde o foco
+  useEffect(() => {
+    if (!isFocused) {
+      Speech.stop();
+      setCameraReady(false); // Reseta cameraReady para forçar reinicialização ao voltar
+      console.log('Tela perdeu o foco, câmera e fala pausadas.');
+      
+    }
+  }, [isFocused]);
+
   const captureAndSendFrame = async () => {
-    if (!cameraRef.current || !cameraReady || isTransitioning) {
+    if (!isFocused || !cameraRef.current || !cameraReady || isTransitioning) {
+      console.log('Captura de frame ignorada. Motivo:', {
+        isFocused,
+        cameraRef: !!cameraRef.current,
+        cameraReady,
+        isTransitioning,
+      });
       return;
     }
 
     try {
+      console.log('Capturando frame...');
       const photo: CameraCapturedPicture = await cameraRef.current.takePictureAsync({
         quality: 0.5,
         base64: false,
@@ -90,42 +110,66 @@ const CameraScreen: React.FC = () => {
         },
       });
 
-      const { personCount, personDistanceMeters, animalCount, animalDistancesMeters, trafficSignCount, holeCount, matchedSigns, unmatchedCrops, imageOutputPath } = response.data;
+      const { personCount, personDistanceMeters, animalCount, animalDistancesMeters, trafficSignCount, signDistanceMeters, holeCount, matchedSigns, unmatchedCrops, imageOutputPath } = response.data;
 
       setProcessedImageUri(imageOutputPath);
 
       const personExist = personCount > 0;
       const animalExist = animalCount > 0;
       const trafficSignExist = trafficSignCount > 0;
-      let personMessage = personExist
-        ? `${personCount === 1 ? 'Detectada uma' : 'Detectadas ' + personCount} pessoa${personCount === 1 ? '' : 's'} a ${personDistanceMeters.join(' e ')} metros de distância`
-        : '';
-      let animalMessage = animalExist
-        ? (personExist ? ' e ' : '') + `${animalCount} anima${animalCount === 1 ? 'l' : 'is'} a ${animalDistancesMeters.join(' e ')} metros de distância`
-        : '';
-      let alertMessage = personMessage + animalMessage;
+      const hasCondition = personExist || animalExist;
+      let alertMessage = '';
 
-      if (personExist || animalExist) {
-        Speech.speak(alertMessage, { language: 'pt-BR' });
+      if (hasCondition) {
+        let personMessage = personExist
+          ? `${personCount === 1 ? 'Detectada uma' : 'Detectadas ' + personCount} pessoa${personCount === 1 ? '' : 's'} a ${personDistanceMeters.join(' e ')} metros de distância`
+          : '';
+        let animalMessage = animalExist
+          ? (personExist ? ' e ' : '') + `${animalCount} anima${animalCount === 1 ? 'l' : 'is'} a ${animalDistancesMeters.join(' e ')} metros de distância`
+          : '';
+        alertMessage = personMessage + animalMessage;
+      }
+
+      // Lógica de alerta para pessoa/animal: reproduz som se mensagem mudou ou passou 15s
+      const now = Date.now();
+      let shouldSpeak = false;
+      if (hasCondition) {
+        shouldSpeak = lastAlertMessageRef.current === null ||
+                      lastAlertMessageRef.current !== alertMessage ||
+                      (now - lastAlertTimestampRef.current > 15000);
+      }
+
+      if (hasCondition && shouldSpeak) {
         Alert.alert('Atenção', alertMessage);
+        Speech.speak(alertMessage, { language: 'pt-BR' });
+        
+        lastAlertMessageRef.current = alertMessage;
+        lastAlertTimestampRef.current = now;
+      } else if (!hasCondition && lastAlertMessageRef.current !== null) {
+        // Reseta a referência quando não há detecção, para forçar alerta na próxima detecção
+        lastAlertMessageRef.current = null;
       }
 
       if (holeCount > 0) {
         const holeMessage = 'Buraco detectado na estrada!';
         Alert.alert('Cuidado', holeMessage);
-        Speech.speak(holeMessage, { language: 'pt-BR' });
+      //  Speech.speak(holeMessage, { language: 'pt-BR' });
       }
 
-      if (trafficSignExist) {
+      // Verifica se há sinal de trânsito próximo (menor ou igual a 2 metros)
+      const minSignDistance = signDistanceMeters.length > 0 ? Math.min(...signDistanceMeters) : Infinity;
+      const trafficSignClose = trafficSignExist && minSignDistance <= 2;
+
+      if (trafficSignClose) {
         let trafficSignMessage = '';
         if (matchedSigns && matchedSigns.length > 0) {
           const sign = matchedSigns[0];
-          trafficSignMessage = `Sinal detectado: ${sign.code} - ${sign.description}`;
+          trafficSignMessage = `Sinal detectado a ${minSignDistance.toFixed(1)} metros: ${sign.code} - ${sign.description}`;
         } else if (unmatchedCrops && unmatchedCrops.length > 0) {
           const unmatched = unmatchedCrops[0];
-          trafficSignMessage = `Sinal não reconhecido (similaridade ${unmatched.maxSimilarityScore.toFixed(2)}).`;
+          trafficSignMessage = `Sinal não reconhecido a ${minSignDistance.toFixed(1)} metros (similaridade ${unmatched.maxSimilarityScore.toFixed(2)} com o sinal ${unmatched.bestMatchCode.toString()}).`;
         } else {
-          trafficSignMessage = 'Sinal de trânsito detectado, mas não identificado.';
+          trafficSignMessage = `Sinal de trânsito detectado a ${minSignDistance.toFixed(1)} metros, mas não identificado.`;
         }
         Alert.alert('Informação', trafficSignMessage);
         Speech.speak(trafficSignMessage, { language: 'pt-BR' });
@@ -154,6 +198,7 @@ const CameraScreen: React.FC = () => {
 
     return () => {
       clearInterval(interval);
+      console.log('Intervalo de captura pausado');
     };
   }, [hasPermission, cameraReady, facing, flash, isFocused, isTransitioning]);
 
@@ -170,7 +215,13 @@ const CameraScreen: React.FC = () => {
   };
 
   const handleToggleView = () => {
+    setIsTransitioning(true); // Pausa a captura durante a transição
+    setCameraReady(false); // Reseta cameraReady para forçar reinicialização
     setPrimaryView(current => (current === 'live' ? 'processed' : 'live'));
+    // Aguarda um pequeno atraso para garantir que a câmera esteja pronta
+    setTimeout(() => {
+      setIsTransitioning(false);
+    }, 500);
   };
 
   if (hasPermission === null) {
@@ -192,72 +243,59 @@ const CameraScreen: React.FC = () => {
     <View style={styles.container}>
       <Stack.Screen options={{ headerShown: false }} />
 
-      {/* Câmera principal sempre ativa e no fundo. Ocupa a tela inteira. */}
+      {/* Câmera principal só é montada se a tela estiver em foco */}
       {isFocused && (
         <CameraView
-          style={StyleSheet.absoluteFillObject}
+          style={primaryView === 'live' ? StyleSheet.absoluteFillObject : styles.pipContainer}
           ref={cameraRef}
           facing={facing}
           flash={flash}
-          onCameraReady={() => setCameraReady(true)}
+          onCameraReady={() => {
+            console.log('Câmera pronta');
+            setCameraReady(true);
+          }}
+          onMountError={(error) => {
+            console.error('Erro ao montar a câmera:', error);
+            Alert.alert('Erro', 'Falha ao inicializar a câmera.');
+          }}
         />
       )}
 
-      {/* Container que irá conter a visualização principal */}
-      <View style={styles.fullScreenOverlay}>
-        {primaryView === 'live' ? (
-          // Tela principal: imagem da câmera sem boxes (apenas o fundo)
-          <View style={StyleSheet.absoluteFill} />
-        ) : (
-          // Tela principal: imagem com boxes (sobreposta ao fundo da câmera)
-          processedImageUri && (
-            <Image
-              source={{ uri: processedImageUri }}
-              style={StyleSheet.absoluteFill}
-              resizeMode="cover"
-            />
-          )
-        )}
-      </View>
-
-      {/* Container da tela PiP */}
-      <TouchableOpacity
-        style={styles.pipContainer}
-        onPress={handleToggleView}
-        activeOpacity={0.7}
-      >
-        {/* Lógica para exibir a visualização oposta na PiP */}
-        {primaryView === 'processed' ? (
-          // PiP: mostra a câmera limpa
-          <View style={StyleSheet.absoluteFill} />
-        ) : (
-          // PiP: mostra a imagem com boxes
-          processedImageUri && (
-            <Image
-              source={{ uri: processedImageUri }}
-              style={StyleSheet.absoluteFill}
-              resizeMode="cover"
-            />
-          )
-        )}
-      </TouchableOpacity>
+      {/* Container para a imagem processada */}
+      {isFocused && processedImageUri && (
+        <TouchableOpacity
+          style={primaryView === 'processed' ? styles.fullScreenOverlay : styles.pipContainer}
+          onPress={handleToggleView}
+          activeOpacity={0.7}
+        >
+          <Image
+            source={{ uri: processedImageUri }}
+            style={StyleSheet.absoluteFill}
+            resizeMode="cover"
+          />
+        </TouchableOpacity>
+      )}
 
       {/* Controles da UI */}
-      <View style={styles.controlsContainer}>
-        <TouchableOpacity style={styles.button} onPress={toggleFacing}>
-          <Ionicons name="camera-reverse" size={30} color="white" />
-        </TouchableOpacity>
-        <TouchableOpacity style={styles.button} onPress={toggleFlash}>
-          <Ionicons name={flashModes[flash].icon as any} size={30} color="white" />
-          <Text style={styles.buttonText}>{flashModes[flash].text}</Text>
-        </TouchableOpacity>
-      </View>
+      {isFocused && (
+        <View style={styles.controlsContainer}>
+          <TouchableOpacity style={styles.button} onPress={toggleFacing}>
+            <Ionicons name="camera-reverse" size={30} color="white" />
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.button} onPress={toggleFlash}>
+            <Ionicons name={flashModes[flash].icon as any} size={30} color="white" />
+            <Text style={styles.buttonText}>{flashModes[flash].text}</Text>
+          </TouchableOpacity>
+        </View>
+      )}
 
       {/* Overlay de Texto */}
-      <View style={styles.overlay}>
-        <Text style={styles.text}>Detecções atuais: {personCount + animalCount + trafficSignCount}</Text>
-        <Text style={styles.text}>Câmera ativa (Safe Driver)</Text>
-      </View>
+      {isFocused && (
+        <View style={styles.overlay}>
+          <Text style={styles.text}>Detecções atuais: {personCount + animalCount + trafficSignCount}</Text>
+          <Text style={styles.text}>Câmera ativa (Safe Driver)</Text>
+        </View>
+      )}
     </View>
   );
 };
